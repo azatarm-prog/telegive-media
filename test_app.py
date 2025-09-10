@@ -1,22 +1,36 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
 from datetime import datetime
 import os
+import hashlib
+import magic
+from PIL import Image
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Database configuration
+# Configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///test.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH', 52428800))  # 50MB
+app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', '/tmp/uploads')
+
+# Allowed file types
+ALLOWED_IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif'}
+ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'mov', 'avi'}
+ALLOWED_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS | ALLOWED_VIDEO_EXTENSIONS
+
+# Create upload directory
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # Initialize database
 db = SQLAlchemy(app)
 
-# Simple Media File model
+# Media File model
 class MediaFile(db.Model):
     __tablename__ = 'media_files'
     
@@ -32,6 +46,40 @@ class MediaFile(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'account_id': self.account_id,
+            'original_filename': self.original_filename,
+            'file_size': self.file_size,
+            'file_type': self.file_type,
+            'mime_type': self.mime_type,
+            'file_hash': self.file_hash,
+            'is_active': self.is_active,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+        }
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_file_hash(file_path):
+    """Calculate SHA256 hash of file"""
+    hash_sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_sha256.update(chunk)
+    return hash_sha256.hexdigest()
+
+def get_file_type(filename):
+    """Determine if file is image or video"""
+    ext = filename.rsplit('.', 1)[1].lower()
+    if ext in ALLOWED_IMAGE_EXTENSIONS:
+        return 'image'
+    elif ext in ALLOWED_VIDEO_EXTENSIONS:
+        return 'video'
+    return 'unknown'
+
 @app.route('/')
 def root():
     return jsonify({
@@ -44,7 +92,11 @@ def root():
             '/health/detailed',
             '/api/test',
             '/api/db/init',
-            '/api/db/status'
+            '/api/db/status',
+            '/api/upload',
+            '/api/files',
+            '/api/files/<int:file_id>',
+            '/api/files/<int:file_id>/download'
         ]
     })
 
@@ -73,11 +125,18 @@ def detailed_health():
     except Exception as e:
         db_status = {'connected': False, 'error': str(e)}
     
+    # Check upload folder
+    upload_status = {
+        'available': os.path.exists(app.config['UPLOAD_FOLDER']),
+        'path': app.config['UPLOAD_FOLDER']
+    }
+    
     return jsonify({
         'status': 'healthy' if db_status.get('connected') else 'unhealthy',
         'service': 'media-service',
         'version': '1.0.0',
         'database': db_status,
+        'storage': upload_status,
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -92,9 +151,7 @@ def api_test():
 @app.route('/api/db/init', methods=['POST'])
 def init_database():
     try:
-        # Create all tables
         db.create_all()
-        
         return jsonify({
             'success': True,
             'message': 'Database initialized successfully',
@@ -110,10 +167,8 @@ def init_database():
 @app.route('/api/db/status')
 def database_status():
     try:
-        # Test connection
         db.session.execute(db.text('SELECT 1'))
         
-        # Get table info
         tables_info = {}
         try:
             file_count = MediaFile.query.count()
@@ -135,6 +190,200 @@ def database_status():
             'connected': False,
             'error': str(e),
             'timestamp': datetime.utcnow().isoformat()
+        }), 500
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    try:
+        # Check if file is present
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'}), 400
+        
+        # Get account_id from form data
+        account_id = request.form.get('account_id')
+        if not account_id:
+            return jsonify({'success': False, 'error': 'account_id is required'}), 400
+        
+        try:
+            account_id = int(account_id)
+        except ValueError:
+            return jsonify({'success': False, 'error': 'account_id must be an integer'}), 400
+        
+        # Validate file type
+        if not allowed_file(file.filename):
+            return jsonify({
+                'success': False, 
+                'error': f'File type not allowed. Allowed types: {", ".join(ALLOWED_EXTENSIONS)}'
+            }), 400
+        
+        # Secure filename
+        filename = secure_filename(file.filename)
+        if not filename:
+            return jsonify({'success': False, 'error': 'Invalid filename'}), 400
+        
+        # Create unique filename with timestamp
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        unique_filename = f"{timestamp}_{filename}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        
+        # Save file
+        file.save(file_path)
+        
+        # Get file info
+        file_size = os.path.getsize(file_path)
+        file_hash = get_file_hash(file_path)
+        file_type = get_file_type(filename)
+        
+        # Get MIME type
+        try:
+            mime_type = magic.from_file(file_path, mime=True)
+        except:
+            mime_type = 'application/octet-stream'
+        
+        # Save to database
+        media_file = MediaFile(
+            account_id=account_id,
+            original_filename=filename,
+            file_path=file_path,
+            file_size=file_size,
+            file_type=file_type,
+            mime_type=mime_type,
+            file_hash=file_hash
+        )
+        
+        db.session.add(media_file)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'File uploaded successfully',
+            'file': media_file.to_dict(),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to upload file'
+        }), 500
+
+@app.route('/api/files', methods=['GET'])
+def list_files():
+    try:
+        # Get query parameters
+        account_id = request.args.get('account_id', type=int)
+        page = request.args.get('page', 1, type=int)
+        per_page = min(request.args.get('per_page', 10, type=int), 100)
+        
+        # Build query
+        query = MediaFile.query.filter_by(is_active=True)
+        if account_id:
+            query = query.filter_by(account_id=account_id)
+        
+        # Paginate
+        pagination = query.paginate(
+            page=page, 
+            per_page=per_page, 
+            error_out=False
+        )
+        
+        files = [file.to_dict() for file in pagination.items]
+        
+        return jsonify({
+            'success': True,
+            'files': files,
+            'pagination': {
+                'page': page,
+                'per_page': per_page,
+                'total': pagination.total,
+                'pages': pagination.pages,
+                'has_next': pagination.has_next,
+                'has_prev': pagination.has_prev
+            },
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to list files'
+        }), 500
+
+@app.route('/api/files/<int:file_id>', methods=['GET'])
+def get_file(file_id):
+    try:
+        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        return jsonify({
+            'success': True,
+            'file': media_file.to_dict(),
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to get file'
+        }), 500
+
+@app.route('/api/files/<int:file_id>', methods=['DELETE'])
+def delete_file(file_id):
+    try:
+        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        # Soft delete
+        media_file.is_active = False
+        media_file.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'File deleted successfully',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to delete file'
+        }), 500
+
+@app.route('/api/files/<int:file_id>/download', methods=['GET'])
+def download_file(file_id):
+    try:
+        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        if not os.path.exists(media_file.file_path):
+            return jsonify({'success': False, 'error': 'File not found on disk'}), 404
+        
+        return send_file(
+            media_file.file_path,
+            as_attachment=True,
+            download_name=media_file.original_filename,
+            mimetype=media_file.mime_type
+        )
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to download file'
         }), 500
 
 if __name__ == '__main__':
