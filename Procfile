@@ -1,2 +1,2 @@
-web: gunicorn --bind 0.0.0.0:$PORT --workers 4 --threads 4 --timeout 120 --log-level info app:create_app()
+web: gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 120 --log-level info wsgi:application
 
