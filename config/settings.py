@@ -3,6 +3,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def get_engine_options(database_uri):
+    """Get appropriate engine options based on database type"""
+    if 'sqlite' in database_uri:
+        return {
+            'pool_pre_ping': True,
+            'pool_recycle': 300
+        }
+    else:
+        return {
+            'pool_pre_ping': True,
+            'pool_recycle': 300,
+            'pool_timeout': 20,
+            'max_overflow': 0
+        }
+
 class Config:
     """Base configuration class"""
     
@@ -10,12 +25,9 @@ class Config:
     DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://user:password@localhost:5432/telegive')
     SQLALCHEMY_DATABASE_URI = DATABASE_URL
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SQLALCHEMY_ENGINE_OPTIONS = {
-        'pool_pre_ping': True,
-        'pool_recycle': 300,
-        'pool_timeout': 20,
-        'max_overflow': 0
-    }
+    
+    def __init__(self):
+        self.SQLALCHEMY_ENGINE_OPTIONS = get_engine_options(self.SQLALCHEMY_DATABASE_URI)
     
     # Security
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -73,8 +85,12 @@ class TestingConfig(Config):
     """Testing configuration"""
     DEBUG = True
     TESTING = True
-    SQLALCHEMY_DATABASE_URI = os.getenv('TEST_DATABASE_URL', 'postgresql://test:test@localhost:5432/test_telegive')
+    SQLALCHEMY_DATABASE_URI = os.getenv('TEST_DATABASE_URL', 'sqlite:///:memory:')
     UPLOAD_FOLDER = '/tmp/test_uploads'
+    
+    def __init__(self):
+        super().__init__()
+        self.SQLALCHEMY_ENGINE_OPTIONS = get_engine_options(self.SQLALCHEMY_DATABASE_URI)
 
 class ProductionConfig(Config):
     """Production configuration"""

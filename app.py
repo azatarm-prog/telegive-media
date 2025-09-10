@@ -51,11 +51,11 @@ def init_extensions(app):
     
     # Rate limiting
     limiter = Limiter(
-        app,
         key_func=get_remote_address,
         default_limits=[app.config.get('RATELIMIT_DEFAULT', '100 per hour')],
         storage_uri=app.config.get('RATELIMIT_STORAGE_URL', 'memory://')
     )
+    limiter.init_app(app)
     
     # Store limiter in app for use in routes
     app.limiter = limiter
@@ -66,11 +66,13 @@ def register_blueprints(app):
     from routes.health import health_bp
     from routes.media import media_bp
     from routes.upload import upload_bp
+    from routes.admin import admin_bp
     
     # Register blueprints
     app.register_blueprint(health_bp)
-    app.register_blueprint(media_bp, url_prefix='/api/media')
-    app.register_blueprint(upload_bp, url_prefix='/api/media')
+    app.register_blueprint(media_bp, url_prefix='/api')
+    app.register_blueprint(upload_bp, url_prefix='/api')
+    app.register_blueprint(admin_bp)
 
 def register_error_handlers(app):
     """Register error handlers"""
