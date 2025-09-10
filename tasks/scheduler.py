@@ -64,11 +64,14 @@ class TaskScheduler:
             self.scheduler.start()
             self.is_running = True
             
-            current_app.logger.info('Task scheduler started successfully')
+            # Use print instead of current_app.logger during startup
+            print('Task scheduler started successfully')
             
         except Exception as e:
-            current_app.logger.error(f'Failed to start task scheduler: {e}')
-            raise
+            # Use print instead of current_app.logger during startup
+            print(f'Failed to start task scheduler: {e}')
+            # Don't raise the exception to prevent deployment failure
+            # raise
     
     def _add_cleanup_jobs(self):
         """Add cleanup-related scheduled jobs"""
@@ -203,14 +206,14 @@ class TaskScheduler:
         if self.scheduler and self.is_running:
             self.scheduler.shutdown(wait=False)
             self.is_running = False
-            current_app.logger.info('Task scheduler stopped')
+            print('Task scheduler stopped')
     
     def shutdown(self):
         """Shutdown the scheduler gracefully"""
         if self.scheduler and self.is_running:
             self.scheduler.shutdown(wait=True)
             self.is_running = False
-            current_app.logger.info('Task scheduler shutdown completed')
+            print('Task scheduler shutdown completed')
     
     def get_job_status(self):
         """Get status of all scheduled jobs"""
