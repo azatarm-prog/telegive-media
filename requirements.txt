@@ -5,3 +5,4 @@ python-dotenv==1.0.0
 Pillow==10.0.0
 python-magic==0.4.27
 Werkzeug==2.3.7
+requests==2.31.0

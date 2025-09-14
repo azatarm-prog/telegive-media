@@ -5,8 +5,10 @@ from datetime import datetime
 import os
 import hashlib
 import magic
+import requests
 from PIL import Image
 from dotenv import load_dotenv
+from functools import wraps
 
 load_dotenv()
 
@@ -18,6 +20,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-key')
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH', 52428800))  # 50MB
 app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', '/tmp/uploads')
+
+# Service Configuration
+AUTH_SERVICE_URL = os.getenv('AUTH_SERVICE_URL', 'https://web-production-ddd7e.up.railway.app')
+SERVICE_TOKEN = os.getenv('SERVICE_TOKEN', 'ch4nn3l_s3rv1c3_t0k3n_2025_s3cur3_r4nd0m_str1ng')
+SERVICE_TOKEN_HEADER = os.getenv('SERVICE_TOKEN_HEADER', 'X-Service-Token')
 
 # Allowed file types
 ALLOWED_IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif'}
@@ -60,6 +67,57 @@ class MediaFile(db.Model):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
 
+def verify_auth_token(token):
+    """Verify authentication token with Auth Service"""
+    try:
+        headers = {SERVICE_TOKEN_HEADER: SERVICE_TOKEN}
+        response = requests.post(
+            f"{AUTH_SERVICE_URL}/api/auth/verify",
+            json={"token": token},
+            headers=headers,
+            timeout=5
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        return None
+        
+    except Exception as e:
+        print(f"Auth verification error: {e}")
+        return None
+
+def require_auth(f):
+    """Authentication decorator for protected endpoints"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Check for Authorization header
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return jsonify({'success': False, 'error': 'Missing or invalid authorization header'}), 401
+        
+        token = auth_header.split(' ')[1]
+        auth_data = verify_auth_token(token)
+        
+        if not auth_data or not auth_data.get('valid'):
+            return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+        
+        # Add user info to request context
+        request.user_id = auth_data.get('user_id')
+        request.account_id = auth_data.get('account_id')
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
+def require_service_auth(f):
+    """Service-to-service authentication decorator"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        service_token = request.headers.get(SERVICE_TOKEN_HEADER)
+        if service_token != SERVICE_TOKEN:
+            return jsonify({'success': False, 'error': 'Invalid service token'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -86,6 +144,8 @@ def root():
         'service': 'Media Management Service',
         'status': 'running',
         'version': '1.0.0',
+        'environment': 'production',
+        'auth_integration': 'enabled',
         'endpoints': [
             '/',
             '/health',
@@ -96,7 +156,8 @@ def root():
             '/api/upload',
             '/api/files',
             '/api/files/<int:file_id>',
-            '/api/files/<int:file_id>/download'
+            '/api/files/<int:file_id>/download',
+            '/api/files/<int:file_id>/associate'
         ]
     })
 
@@ -131,12 +192,22 @@ def detailed_health():
         'path': app.config['UPLOAD_FOLDER']
     }
     
+    # Test auth service connection
+    auth_status = {'connected': False}
+    try:
+        headers = {SERVICE_TOKEN_HEADER: SERVICE_TOKEN}
+        response = requests.get(f"{AUTH_SERVICE_URL}/health", headers=headers, timeout=5)
+        auth_status = {'connected': response.status_code == 200, 'url': AUTH_SERVICE_URL}
+    except Exception as e:
+        auth_status = {'connected': False, 'error': str(e), 'url': AUTH_SERVICE_URL}
+    
     return jsonify({
         'status': 'healthy' if db_status.get('connected') else 'unhealthy',
         'service': 'media-service',
         'version': '1.0.0',
         'database': db_status,
         'storage': upload_status,
+        'auth_service': auth_status,
         'timestamp': datetime.utcnow().isoformat()
     })
 
@@ -149,6 +220,7 @@ def api_test():
     })
 
 @app.route('/api/db/init', methods=['POST'])
+@require_service_auth
 def init_database():
     try:
         db.create_all()
@@ -165,6 +237,7 @@ def init_database():
         }), 500
 
 @app.route('/api/db/status')
+@require_service_auth
 def database_status():
     try:
         db.session.execute(db.text('SELECT 1'))
@@ -193,6 +266,7 @@ def database_status():
         }), 500
 
 @app.route('/api/upload', methods=['POST'])
+@require_auth
 def upload_file():
     try:
         # Check if file is present
@@ -203,15 +277,8 @@ def upload_file():
         if file.filename == '':
             return jsonify({'success': False, 'error': 'No file selected'}), 400
         
-        # Get account_id from form data
-        account_id = request.form.get('account_id')
-        if not account_id:
-            return jsonify({'success': False, 'error': 'account_id is required'}), 400
-        
-        try:
-            account_id = int(account_id)
-        except ValueError:
-            return jsonify({'success': False, 'error': 'account_id must be an integer'}), 400
+        # Use account_id from authenticated user
+        account_id = request.account_id
         
         # Validate file type
         if not allowed_file(file.filename):
@@ -274,17 +341,16 @@ def upload_file():
         }), 500
 
 @app.route('/api/files', methods=['GET'])
+@require_auth
 def list_files():
     try:
-        # Get query parameters
-        account_id = request.args.get('account_id', type=int)
+        # Use account_id from authenticated user
+        account_id = request.account_id
         page = request.args.get('page', 1, type=int)
         per_page = min(request.args.get('per_page', 10, type=int), 100)
         
-        # Build query
-        query = MediaFile.query.filter_by(is_active=True)
-        if account_id:
-            query = query.filter_by(account_id=account_id)
+        # Build query for user's files only
+        query = MediaFile.query.filter_by(account_id=account_id, is_active=True)
         
         # Paginate
         pagination = query.paginate(
@@ -317,9 +383,16 @@ def list_files():
         }), 500
 
 @app.route('/api/files/<int:file_id>', methods=['GET'])
+@require_auth
 def get_file(file_id):
     try:
-        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        # Only allow access to user's own files
+        media_file = MediaFile.query.filter_by(
+            id=file_id, 
+            account_id=request.account_id, 
+            is_active=True
+        ).first()
+        
         if not media_file:
             return jsonify({'success': False, 'error': 'File not found'}), 404
         
@@ -337,9 +410,16 @@ def get_file(file_id):
         }), 500
 
 @app.route('/api/files/<int:file_id>', methods=['DELETE'])
+@require_auth
 def delete_file(file_id):
     try:
-        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        # Only allow deletion of user's own files
+        media_file = MediaFile.query.filter_by(
+            id=file_id, 
+            account_id=request.account_id, 
+            is_active=True
+        ).first()
+        
         if not media_file:
             return jsonify({'success': False, 'error': 'File not found'}), 404
         
@@ -363,9 +443,106 @@ def delete_file(file_id):
         }), 500
 
 @app.route('/api/files/<int:file_id>/download', methods=['GET'])
+@require_auth
 def download_file(file_id):
     try:
+        # Only allow download of user's own files
+        media_file = MediaFile.query.filter_by(
+            id=file_id, 
+            account_id=request.account_id, 
+            is_active=True
+        ).first()
+        
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        if not os.path.exists(media_file.file_path):
+            return jsonify({'success': False, 'error': 'File not found on disk'}), 404
+        
+        return send_file(
+            media_file.file_path,
+            as_attachment=True,
+            download_name=media_file.original_filename,
+            mimetype=media_file.mime_type
+        )
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to download file'
+        }), 500
+
+@app.route('/api/files/<int:file_id>/associate', methods=['POST'])
+@require_auth
+def associate_file(file_id):
+    """Associate a file with a giveaway (for service-to-service communication)"""
+    try:
+        # Only allow association of user's own files
+        media_file = MediaFile.query.filter_by(
+            id=file_id, 
+            account_id=request.account_id, 
+            is_active=True
+        ).first()
+        
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        # Get association data
+        data = request.get_json()
+        giveaway_id = data.get('giveaway_id')
+        
+        if not giveaway_id:
+            return jsonify({'success': False, 'error': 'giveaway_id is required'}), 400
+        
+        return jsonify({
+            'success': True,
+            'message': 'File associated successfully',
+            'file_id': file_id,
+            'giveaway_id': giveaway_id,
+            'file_url': f"/api/files/{file_id}/download",
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to associate file'
+        }), 500
+
+# Service-to-service endpoint for other services to get file info
+@app.route('/api/service/files/<int:file_id>', methods=['GET'])
+@require_service_auth
+def service_get_file(file_id):
+    """Service-to-service endpoint to get file information"""
+    try:
         media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        
+        if not media_file:
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        
+        return jsonify({
+            'success': True,
+            'file': media_file.to_dict(),
+            'download_url': f"/api/service/files/{file_id}/download",
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': 'Failed to get file'
+        }), 500
+
+@app.route('/api/service/files/<int:file_id>/download', methods=['GET'])
+@require_service_auth
+def service_download_file(file_id):
+    """Service-to-service endpoint to download files"""
+    try:
+        media_file = MediaFile.query.filter_by(id=file_id, is_active=True).first()
+        
         if not media_file:
             return jsonify({'success': False, 'error': 'File not found'}), 404
         
